@@ -1,51 +1,40 @@
-import os
-import gc
-import wandb
-import numpy as np
-import argparse
-import pandas as pd
-from functools import partial
-
 import sys
-sys.path.append('pytorch-image-models')
-import timm
-import json
+sys.path.append(".")
+from torch.utils.tensorboard import SummaryWriter
+import os
+import torch
+import argparse
+import numpy as np
 from model import Model
 from data.data import CellCropsDataset
 from data.utils import load_crops
 from data.transform import train_transform, val_transform
 from torch.utils.data import DataLoader, WeightedRandomSampler
-import torch
+import json
+from metrics.metrics import Metrics
+from eval import val_epoch
+from tqdm import tqdm
 
-from lee.e2e_lee import get_equivariance_metrics as get_lee_metrics
-from lee.e2e_other import get_equivariance_metrics as get_discrete_metrics
-from lee.loader import get_loaders, eval_average_metrics_wstd
+def train_epoch(model, dataloader, optimizer, criterion, epoch, writer, device=None):
+    model.train()
+    cells = []
+    for i, batch in tqdm(enumerate(dataloader)):
+        x = batch['image']
+        m = batch.get('mask', None)
+        if m is not None:
+            x = torch.cat([x, m], dim=1)
+        x = x.to(device=device)
 
-def numparams(model):
-    return sum(p.numel() for p in model.parameters())
-
-def get_metrics(args, key, loader, model, max_mbs=400):
-    discrete_metrics = eval_average_metrics_wstd(
-        loader, partial(get_discrete_metrics, model), max_mbs=max_mbs,
-    )
-    lee_metrics = eval_average_metrics_wstd(
-        loader, partial(get_lee_metrics, model), max_mbs=max_mbs,
-    )
-    metrics = pd.concat([lee_metrics, discrete_metrics], axis=1)
-
-    metrics["dataset"] = key
-    metrics["model"] = args.modelname
-    metrics["params"] = numparams(model)
-
-    return metrics
-
-def get_args_parser():
-    parser = argparse.ArgumentParser(description='Training Config', add_help=False)
-    parser.add_argument('--output_dir', metavar='NAME', default='equivariance_metrics_cnns',help='experiment name')
-    parser.add_argument('--modelname', metavar='NAME', default='resnet18', help='model name')
-    parser.add_argument('--num_datapoints', type=int, default=60, help='use pretrained model')
-    parser.add_argument('--base_path', type=str, help='configuration_path')
-    return parser
+        y = batch['label'].to(device=device)
+        optimizer.zero_grad()
+        y_pred = model(x)
+        loss = criterion(y_pred, y)
+        if i % 100 == 0:
+            print(f"epoch {epoch} | iterate {i} / {len(dataloader)} | {loss.item()}")
+        writer.add_scalar('Loss/train', loss.item(), epoch * len(dataloader) + i)
+        loss.backward()
+        optimizer.step()
+    return cells
 
 
 def subsample_const_size(crops, size):
@@ -86,12 +75,23 @@ def define_sampler(crops, hierarchy_match=None):
     samples_weight = torch.from_numpy(samples_weight)
     return WeightedRandomSampler(samples_weight.double(), len(samples_weight))
 
-def main(args):
+def force_cudnn_initialization():
+    s = 32
+    dev = torch.device('cuda')
+    torch.nn.functional.conv2d(torch.zeros(s, s, s, s, device=dev), torch.zeros(s, s, s, s, device=dev))
 
+if __name__ == "__main__":
+    force_cudnn_initialization()
+    parser = argparse.ArgumentParser(description='Arguments')
+    parser.add_argument('--base_path', type=str,
+                        help='configuration_path')
+    args = parser.parse_args()
+
+    writer = SummaryWriter(log_dir=args.base_path)
     config_path = os.path.join(args.base_path, "config.json")
     with open(config_path) as f:
         config = json.load(f)
-
+    criterion = torch.nn.CrossEntropyLoss()
     train_crops, val_crops = load_crops(config["root_dir"],
                                         config["channels_path"],
                                         config["crop_size"],
@@ -120,6 +120,8 @@ def main(args):
     model = Model(num_channels, class_num)
 
     model = model.to(device=device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"])
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.85)
 
     train_loader = DataLoader(train_dataset, batch_size=config["batch_size"],
                               num_workers=config["num_workers"],
@@ -130,88 +132,24 @@ def main(args):
     val_loader = DataLoader(val_dataset, batch_size=config["batch_size"],
                             num_workers=config["num_workers"], shuffle=False)
     print(len(train_loader), len(val_loader))
-
-    wandb.init(project="LieDerivEquivariance", config=args)
-    args.__dict__.update(wandb.config)
-
-    print(args)
-
-    if not os.path.exists(args.output_dir):
-        os.makedirs(args.output_dir)
-
-    print(args.modelname)
-
-    # model = getattr(timm.models, args.modelname)(pretrained=True)
-    model.eval()
-
-    evaluated_metrics = []
-
-    # imagenet_train_loader, imagenet_test_loader = get_loaders(
-    #     model,
-    #     dataset="imagenet",
-    #     data_dir="/imagenet",
-    #     batch_size=1,
-    #     num_train=args.num_datapoints,
-    #     num_val=args.num_datapoints,
-    #     args=args,
-    #     train_split='train',
-    #     val_split='validation',
-    # )
-
-    evaluated_metrics += [
-        get_metrics(args, "Imagenet_train", train_loader, model),
-        get_metrics(args, "Imagenet_test", val_loader, model)
-    ]
-    gc.collect()
-
-    # _, cifar_test_loader = get_loaders(
-    #     model,
-    #     dataset="torch/cifar100",
-    #     data_dir="/scratch/nvg7279/cifar",
-    #     batch_size=1,
-    #     num_train=args.num_datapoints,
-    #     num_val=args.num_datapoints,
-    #     args=args,
-    #     train_split='train',
-    #     val_split='validation',
-    # )
-
-    # evaluated_metrics += [get_metrics(args, "cifar100", cifar_test_loader, model, max_mbs=args.num_datapoints)]
-    # gc.collect()
-
-    # _, retinopathy_loader = get_loaders(
-    #     model,
-    #     dataset="tfds/diabetic_retinopathy_detection",
-    #     data_dir="/scratch/nvg7279/tfds",
-    #     batch_size=1,
-    #     num_train=1e8,
-    #     num_val=1e8,
-    #     args=args,
-    #     train_split="train",
-    #     val_split="train",
-    # )
-
-    # evaluated_metrics += [get_metrics(args, "retinopathy", retinopathy_loader, model, max_mbs=args.num_datapoints)]
-    # gc.collect()
-
-    # _, histology_loader = get_loaders(
-    #     model,
-    #     dataset="tfds/colorectal_histology",
-    #     data_dir="/scratch/nvg7279/tfds",
-    #     batch_size=1,
-    #     num_train=1e8,
-    #     num_val=1e8,
-    #     args=args,
-    #     train_split="train",
-    #     val_split="train",
-    # )
-
-    # evaluated_metrics += [get_metrics(args, "histology", histology_loader, model, max_mbs=args.num_datapoints)]
-    # gc.collect()
-
-    df = pd.concat(evaluated_metrics)
-    df.to_csv(os.path.join(args.output_dir, args.modelname + ".csv"))
-
-if __name__ == "__main__":
-    args = get_args_parser().parse_args()
-    main(args)
+    val_macro_metrics_path = os.path.join(args.base_path, f"macro_metrics.csv")
+    for i in range(config["epoch_max"]):
+        if (i % 10 == 0):
+            cells_val, results_val = val_epoch(model, val_loader, device=device)
+            metrics = Metrics([],
+                              writer,
+                              prefix="val")
+            metrics(cells_val, results_val, i)
+            val_results_path = os.path.join(args.base_path, f"val_results_{i}.csv")
+            metrics.save_results(val_results_path, val_macro_metrics_path, cells_val, results_val)
+            #  TODO uncooment to eval on the train as well
+            # cells_train, results_train = val_epoch(model, train_loader_for_eval, device=device)
+            #  metrics = Metrics(
+            #     [],
+            #     writer,
+            #     prefix="train")
+            # metrics(cells_train, results_train, i)
+            # metrics.save_results(os.path.join(args.base_path, f"train_results_{i}.csv"), cells_train, results_train)
+        train_epoch(model, train_loader, optimizer, criterion, device=device, epoch=i, writer=writer)
+        print(f"Epoch {i} done!")
+        torch.save(model.state_dict(), os.path.join(args.base_path, f"./weights_{i}_count.pth"))

@@ -3,7 +3,12 @@ import pandas as pd
 from .lie_derivs import *
 
 def get_equivariance_metrics(model, minibatch):
-    x, y = minibatch
+    x = minibatch['image']
+    m = minibatch.get('mask', None)
+    if m is not None:
+        x = torch.cat([x, m], dim=1)
+
+    y = minibatch['label']
     if torch.cuda.is_available():
         model = model.cuda()
         x, y = x.cuda(), y.cuda()

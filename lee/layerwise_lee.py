@@ -78,7 +78,8 @@ from timm.models.mlp_mixer import MixerBlock, Affine, SpatialGatingBlock
 from timm.models.layers import PatchEmbed, Mlp, DropPath, BlurPool2d
 
 # from timm.models.layers import FastAdaptiveAvgPool2d,AdaptiveAvgMaxPool2d
-from timm.models.layers import GatherExcite, EvoNormBatch2d
+from timm.models.layers.evo_norm import EvoNormBatch2d
+from timm.models.layers.gather_excite import GatherExcite
 from timm.models.senet import SEModule
 from timm.models.efficientnet_blocks import SqueezeExcite
 from timm.models.convit import MHSA, GPSA

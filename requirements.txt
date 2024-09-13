@@ -4,3 +4,6 @@ pyyaml
 e2cnn
 pandas
 wandb
+tensorboard
+tqdm
+opencv-python

@@ -70,7 +70,12 @@ def rotation_sample_invariance(model,inp_imgs,model_out,eta=np.pi//16):
 
 
 def get_equivariance_metrics(model, minibatch, num_probes=20):
-    x, y = minibatch
+    x = minibatch['image']
+    m = minibatch.get('mask', None)
+    if m is not None:
+        x = torch.cat([x, m], dim=1)
+    y = minibatch['label']
+
     if torch.cuda.is_available():
         model = model.cuda()
         x, y = x.cuda(), y.cuda()
